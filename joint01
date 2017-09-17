@@ -1,0 +1,694 @@
+jointCox.reg.exponential = function (t.event, event, t.death, death, Z1, Z2, group, alpha = 1, 
+                                     kappa_grid = c(seq(10, 1e+17, length = 30)), LCV_plot = TRUE, 
+                                     Randomize_num = 10, Adj = 500, convergence.par = FALSE) 
+{
+  T1 = t.event
+  T2 = t.death
+  d1 = event
+  d2 = death
+  p1 = ncol(Z1)
+  p2 = ncol(Z2)
+  G_id = as.numeric((levels(factor(group))))
+  G = length(G_id)
+  n.event = tapply(d1, group, FUN = sum)
+  n.death = tapply(d2, group, FUN = sum)
+  n.censor = tapply(1 - d2, group, FUN = sum)
+  count = cbind(table(group), n.event, n.death, n.censor)
+  colnames(count) = c("No.of samples", "No.of events", "No.of deaths", 
+                      "No.of censors")
+  
+  l.func = function(phi) {
+    g1 = exp(pmax(pmin(phi[1], 500), -500))
+    g2 = exp(pmax(pmin(phi[2], 500), -500))
+    eta = exp(phi[3])
+    theta = min(exp(phi[4]), exp(5))
+    beta1 = phi[(4 + 1):(4 + p1)]
+    beta2 = phi[(4 + p1 + 1):(4 + p1 + p2)]
+    l = 0
+    bZ1 = as.vector(as.matrix(Z1) %*% beta1)
+    bZ2 = as.vector(as.matrix(Z2) %*% beta2)
+    
+    r1 = as.vector(rep(g1,length(T1)))
+    r2 = as.vector(rep(g2,length(T2)))
+    R1 = as.vector(T1 * g1)
+    R2 = as.vector(T2 * g2)
+    
+    #R_max = max(R1, R2)
+    #r1 = r1/R_max
+    #r2 = r2/R_max
+    #R1 = R1/R_max
+    #R2 = R2/R_max
+    
+    l = l + sum(d1 * (log(r1) + bZ1)) + sum(d2 * (log(r2) + bZ2))
+    for (i in G_id) {
+      Gi = c(group == i)
+      m1 = sum(d1[Gi])
+      m2 = sum(d2[Gi])
+      m12 = sum(d1[Gi] * d2[Gi])
+      EZ1 = exp(bZ1[Gi]) * R1[Gi]
+      EZ2 = exp(bZ2[Gi]) * R2[Gi]
+      D1 = as.logical(d1[Gi])
+      D2 = as.logical(d2[Gi])
+      func1 = function(u) {
+        S1 = pmin(exp(theta * u %*% t(EZ1)), exp(500))
+        S2 = pmin(exp(theta * u^alpha %*% t(EZ2)), exp(500))
+        A = (S1 + S2 - 1)
+        E1 = apply((S1/A)[, D1, drop = FALSE], MARGIN = 1, FUN = prod)
+        E2 = apply((S2/A)[, D2, drop = FALSE], MARGIN = 1, FUN = prod)
+        Psi = rowSums((1/theta) * log(A))
+        D12 = exp(-Psi + Adj)
+        u^(m1 + alpha * m2) * E1 * E2 * D12 * (1 + theta)^m12 * dgamma(u, shape = 1/eta, scale = eta)
+      }
+      Int = try(integrate(func1, 0.001, 10, stop.on.error = FALSE))
+      if (class(Int) == "try-error") {
+        l = l - 5e+05
+      }
+      else {
+        if (Int$value == 0) {
+          l = l - 5e+05
+        }
+        else {
+          l = l + log(Int$value) - Adj
+        }
+      }
+    }
+    -l
+  }
+  p0 = rep(0, 4 + p1 + p2)
+  res = nlm(l.func, p = p0, hessian = TRUE)
+  MPL = -res$minimum
+  R_num = 0
+  repeat {
+    if ((min(eigen(res$hessian)$values) > 0) & (res$code == 1)) {
+      break
+    }
+    if (R_num >= Randomize_num) {
+      break
+    }
+    R_num = R_num + 1
+    p0_Rand = runif(4 + p1 + p2, -1, 1)
+    res_Rand = nlm(l.func, p = p0_Rand, hessian = TRUE)
+    MPL_Rand = -res_Rand$minimum
+    if (MPL_Rand > MPL) {
+      res = res_Rand
+      MPL = -res$minimum
+    }
+  }
+  H_PL = -res$hessian
+  DF_upper = 18 + p1 + p2
+  temp = (det(H_PL) == 0) | is.na(det(H_PL))
+  if (temp) {
+    V = solve(-H_PL + diag(rep(1e-04, 4 + p1 + p2)), tol = 10^(-50))
+  }
+  else {
+    V = solve(-H_PL, tol = 10^(-50))
+  }
+  D_PL = diag(c(1/exp(res$estimate[1:4]), rep(1, p1 + p2)))
+  H_PL = D_PL %*% H_PL %*% D_PL
+  H = H_PL
+  #H[1:5, 1:5] = H[1:5, 1:5] + 2 * K1_est * Omega
+  #H[6:10, 6:10] = H[6:10, 6:10] + 2 * K2_est * Omega
+  if (is.na(det(H_PL)) | det(H_PL) == 0) {
+    DF = DF_upper
+  }
+  else {
+    DF = min(max(sum(diag(solve(H_PL, tol = 10^(-50)) %*% H)), p1 + p2 + 2), DF_upper)
+  }
+  #K1_est = K2_est = 0
+  LCV = -l.func(res$estimate) - DF
+  convergence_res = c(MPL = MPL, DF = DF, LCV = LCV, code = res$code, No.of.iterations = res$iterations, No.of.randomizations = R_num)
+  beta1_est = res$est[(4 + 1):(4 + p1)]
+  beta2_est = res$est[(4 + p1 + 1):(4 + p1 + p2)]
+  g_est = exp(res$est[1])
+  h_est = exp(res$est[2])
+  eta_est = exp(res$est[3])
+  theta_est = exp(res$est[4])
+  tau_est = theta_est/(theta_est + 2)
+  beta1_se = sqrt(diag(V)[(4 + 1):(4 + p1)])
+  beta2_se = sqrt(diag(V)[(4 + p1 + 1):(4 + p1 + p2)])
+  eta_se = eta_est * sqrt(diag(V)[3])
+  theta_se = theta_est * sqrt(diag(V)[4])
+  tau_se = 2/(theta_est + 2)^2 * theta_se
+  g_var = g_est * V[1] * g_est
+  h_var = h_est * V[2] * h_est
+  beta1_res = c(estimate = beta1_est, SE = beta1_se, Lower = beta1_est - 1.96 * beta1_se, Upper = beta1_est + 1.96 * beta1_se)
+  beta2_res = c(estimate = beta2_est, SE = beta2_se, Lower = beta2_est - 1.96 * beta2_se, Upper = beta2_est + 1.96 * beta2_se)
+  eta_res = c(estimate = eta_est, SE = eta_se, Lower = eta_est * exp(-1.96 * sqrt(diag(V)[3])), Upper = eta_est * exp(1.96 * sqrt(diag(V)[3])))
+  theta_res = c(estimate = theta_est, SE = theta_se, Lower = theta_est * exp(-1.96 * sqrt(diag(V)[4])), Upper = theta_est * exp(1.96 * sqrt(diag(V)[4])))
+  tau_res = c(estimate = tau_est, tau_se = tau_se, Lower = tau_est - 1.96 * tau_se, Upper = tau_est + 1.96 * tau_se)
+  if (convergence.par == FALSE) {
+    convergence.parameters = NULL
+  }
+  else {
+    convergence.parameters = list(log_estimate = res$est, gradient = -res$gradient, log_var = V)
+  }
+  list(count = count, beta1 = beta1_res, beta2 = beta2_res, 
+       eta = eta_res, theta = theta_res, tau = tau_res, 
+       g = g_est, h = h_est, g_var = g_var, h_var = h_var, 
+       convergence = convergence_res, convergence.parameters = convergence.parameters,
+       code = res$code, No.of.iterations = res$iterations, No.of.randomizations = R_num)
+}
+
+
+jointCox.reg.weibull = function (t.event, event, t.death, death, Z1, Z2, group, alpha = 1, 
+                                 kappa_grid = c(seq(10, 1e+17, length = 30)), LCV_plot = TRUE, 
+                                 Randomize_num = 10, Adj = 500, convergence.par = FALSE) 
+{
+  T1 = t.event
+  T2 = t.death
+  d1 = event
+  d2 = death
+  p1 = ncol(Z1)
+  p2 = ncol(Z2)
+  G_id = as.numeric((levels(factor(group))))
+  G = length(G_id)
+  n.event = tapply(d1, group, FUN = sum)
+  n.death = tapply(d2, group, FUN = sum)
+  n.censor = tapply(1 - d2, group, FUN = sum)
+  count = cbind(table(group), n.event, n.death, n.censor)
+  colnames(count) = c("No.of samples", "No.of events", "No.of deaths", 
+                      "No.of censors")
+  #K_est = 10^10
+  #K_est1 = 10^4
+  #K_est2 = 10^4
+  
+  l.func = function(phi) {
+    g1 = exp(pmax(pmin(phi[1:2], 500), -500))
+    g2 = exp(pmax(pmin(phi[3:4], 500), -500))
+    eta = exp(phi[5])
+    theta = min(exp(phi[6]), exp(2))
+    beta1 = phi[(6 + 1):(6 + p1)]
+    beta2 = phi[(6 + p1 + 1):(6 + p1 + p2)]
+    
+    #l = -K1_est * t(g1) %*% Omega %*% g1 - K2_est * t(g2) %*% Omega %*% g2
+    #l = -K_est * (t(g1) %*% diag(c(1,1)) %*% g1 + t(g2) %*% diag(c(1,1)) %*% g2)
+    #l = -K_est2 * t(g1) %*% diag(c(1,1)) %*% g1 - K_est2 * t(g2) %*% diag(c(1,1)) %*% g2
+    l = 0
+    
+    bZ1 = as.vector(as.matrix(Z1) %*% beta1)
+    bZ2 = as.vector(as.matrix(Z2) %*% beta2)
+    
+    weibull.h = function(x)
+    {
+      x[x == 0] = 10^(-5)
+      alpha_0 * lambda_0 * x^(alpha_0 - 1)
+    }
+    weibull.H = function(x)
+    {
+      x[x == 0] = 10^(-5)
+      lambda_0 * x^(alpha_0)
+    }
+    
+    alpha_0 = g1[1]
+    lambda_0 = g1[2]
+    r1 = as.vector(weibull.h(T1))
+    R1 = as.vector(weibull.H(T1))
+    
+    alpha_0 = g2[1]
+    lambda_0 = g2[2]
+    r2 = as.vector(weibull.h(T2))
+    R2 = as.vector(weibull.H(T2))
+    
+    #R_max = max(R1, R2)
+    #r1 = r1 / R_max
+    #R1 = R1 / R_max
+    #r2 = r2 / R_max
+    #R2 = R2 / R_max
+    
+    l = l + sum(d1 * (log(r1) + bZ1)) + sum(d2 * (log(r2) + bZ2))
+    for (i in G_id) {
+      Gi = c(group == i)
+      m1 = sum(d1[Gi])
+      m2 = sum(d2[Gi])
+      m12 = sum(d1[Gi] * d2[Gi])
+      EZ1 = exp(bZ1[Gi]) * R1[Gi]
+      EZ2 = exp(bZ2[Gi]) * R2[Gi]
+      D1 = as.logical(d1[Gi])
+      D2 = as.logical(d2[Gi])
+      func1 = function(u) {
+        S1 = pmin(exp(theta * u %*% t(EZ1)), exp(500))
+        S2 = pmin(exp(theta * u^alpha %*% t(EZ2)), exp(500))
+        A = (S1 + S2 - 1)
+        E1 = apply((S1/A)[, D1, drop = FALSE], MARGIN = 1, FUN = prod)
+        E2 = apply((S2/A)[, D2, drop = FALSE], MARGIN = 1, FUN = prod)
+        Psi = rowSums((1/theta) * log(A))
+        D12 = exp(-Psi + Adj)
+        u^(m1 + alpha * m2) * E1 * E2 * D12 * (1 + theta)^m12 * dgamma(u, shape = 1/eta, scale = eta)
+      }
+      Int = try(integrate(func1, 0.001, 10, stop.on.error = FALSE))
+      if (class(Int) == "try-error") {
+        l = l - 5e+05
+      }
+      else {
+        if (Int$value == 0) {
+          l = l - 5e+05
+        }
+        else {
+          l = l + log(Int$value) - Adj
+        }
+      }
+    }
+    -l
+  }
+  p0 = rep(0, 6 + p1 + p2)
+  res = nlm(l.func, p = p0, hessian = TRUE)
+  MPL = -res$minimum
+  R_num = 0
+  repeat {
+    if ((min(eigen(res$hessian)$values) > 0) & (res$code == 1)) {
+      break
+    }
+    if (R_num >= Randomize_num) {
+      break
+    }
+    R_num = R_num + 1
+    p0_Rand = runif(6 + p1 + p2, -1, 1)
+    res_Rand = nlm(l.func, p = p0_Rand, hessian = TRUE)
+    MPL_Rand = -res_Rand$minimum
+    if (MPL_Rand > MPL) {
+      res = res_Rand
+      MPL = -res$minimum
+    }
+  }
+  
+  H_PL = -res$hessian
+  DF_upper = 18 + p1 + p2
+  temp = (det(H_PL) == 0) | is.na(det(H_PL))
+  if (temp) {
+    V = solve(-H_PL + diag(rep(1e-04, 6 + p1 + p2)), tol = 10^(-50))
+  }
+  else {
+    V = solve(-H_PL, tol = 10^(-50))
+  }
+  D_PL = diag(c(1/exp(res$estimate[1:6]), rep(1, p1 + p2)))
+  H_PL = D_PL %*% H_PL %*% D_PL
+  H = H_PL
+  #H[1:5, 1:5] = H[1:5, 1:5] + 2 * K1_est * Omega
+  #H[6:10, 6:10] = H[6:10, 6:10] + 2 * K2_est * Omega
+  if (is.na(det(H_PL)) | det(H_PL) == 0) {
+    DF = DF_upper
+  }
+  else {
+    DF = min(max(sum(diag(solve(H_PL, tol = 10^(-50)) %*% H)), p1 + p2 + 2), DF_upper)
+  }
+  #K1_est = K2_est = 0
+  LCV = -l.func(res$estimate) - DF
+  convergence_res = c(MPL = MPL, DF = DF, LCV = LCV, code = res$code, No.of.iterations = res$iterations, No.of.randomizations = R_num)
+  beta1_est = res$est[(6 + 1):(6 + p1)]
+  beta2_est = res$est[(6 + p1 + 1):(6 + p1 + p2)]
+  g_est = exp(res$est[1:2])
+  h_est = exp(res$est[3:4])
+  eta_est = exp(res$est[5])
+  theta_est = exp(res$est[6])
+  tau_est = theta_est/(theta_est + 2)
+  beta1_se = sqrt(diag(V)[(6 + 1):(6 + p1)])
+  beta2_se = sqrt(diag(V)[(6 + p1 + 1):(6 + p1 + p2)])
+  eta_se = eta_est * sqrt(diag(V)[5])
+  theta_se = theta_est * sqrt(diag(V)[6])
+  tau_se = 2/(theta_est + 2)^2 * theta_se
+  g_var = diag(g_est) %*% V[1:2, 1:2] %*% diag(g_est)
+  h_var = diag(h_est) %*% V[3:4, 3:4] %*% diag(h_est)
+  beta1_res = c(estimate = beta1_est, SE = beta1_se, Lower = beta1_est - 1.96 * beta1_se, Upper = beta1_est + 1.96 * beta1_se)
+  beta2_res = c(estimate = beta2_est, SE = beta2_se, Lower = beta2_est - 1.96 * beta2_se, Upper = beta2_est + 1.96 * beta2_se)
+  eta_res = c(estimate = eta_est, SE = eta_se, Lower = eta_est * exp(-1.96 * sqrt(diag(V)[5])), Upper = eta_est * exp(1.96 * sqrt(diag(V)[5])))
+  theta_res = c(estimate = theta_est, SE = theta_se, Lower = theta_est * exp(-1.96 * sqrt(diag(V)[6])), Upper = theta_est * exp(1.96 * sqrt(diag(V)[6])))
+  tau_res = c(estimate = tau_est, tau_se = tau_se, Lower = tau_est - 1.96 * tau_se, Upper = tau_est + 1.96 * tau_se)
+  if (convergence.par == FALSE) {
+    convergence.parameters = NULL
+  }
+  else {
+    convergence.parameters = list(log_estimate = res$est, gradient = -res$gradient, log_var = V)
+  }
+  list(count = count, beta1 = beta1_res, beta2 = beta2_res, 
+       eta = eta_res, theta = theta_res, tau = tau_res, 
+       g = g_est, h = h_est, g_var = g_var, h_var = h_var, 
+       convergence = convergence_res, convergence.parameters = convergence.parameters)
+  
+  #list(res = res, R_num)
+  #list(count = count, p0 = p0, gradian = gradian, H = H, res = res)
+}
+
+
+
+
+#case 1 N=100
+G=5
+N=100
+theta_true=2 ## copula parameter ##
+beta1_true=1
+beta2_true=1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 1 N=100
+
+#case 1 N=200
+G=5
+N=200
+theta_true=2 ## copula parameter ##
+beta1_true=1
+beta2_true=1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 1 N=200
+
+#case 2 N=100
+G=5
+N=100
+theta_true=2 ## copula parameter ##
+beta1_true=-1
+beta2_true=-1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 2 N=100
+
+#case 2 N=200
+G=5
+N=200
+theta_true=2 ## copula parameter ##
+beta1_true=-1
+beta2_true=-1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 2 N=200
+
+#case 3 N=100
+G=5
+N=100
+theta_true=6 ## copula parameter ##
+beta1_true=1
+beta2_true=1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 3 N=100
+
+#case 3 N=200
+G=5
+N=200
+theta_true=6 ## copula parameter ##
+beta1_true=1
+beta2_true=1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 3 N=200
+
+#case 4 N=100
+G=5
+N=100
+theta_true=6 ## copula parameter ##
+beta1_true=-1
+beta2_true=-1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 4 N=100
+
+#case 4 N=200
+G=5
+N=200
+theta_true=6 ## copula parameter ##
+beta1_true=-1
+beta2_true=-1
+r1_true=1
+r2_true=1
+eta_true=0.5
+alpha_true=1
+#case 4 N=200
+
+
+# weibull simulation =========================================================
+weibull.h = function(x)
+{
+  x[x == 0] = 10^(-2)
+  alpha_0 * lambda_0 * x^(alpha_0 - 1)
+}
+
+weibull.H = function(x)
+{
+  x[x == 0] = 10^(-2)
+  lambda_0 * x^(alpha_0)
+
+}
+
+m=50
+beta1_hat=c()
+beta1_SE=c()
+beta1_CP=c()
+
+beta2_hat=c()
+beta2_SE=c()
+beta2_CP=c()
+
+eta_hat=c()
+eta_SE=c()
+eta_CP=c()
+
+theta_hat=c()
+theta_SE=c()
+theta_CP=c()
+
+#lam1_hat = c()
+#lam1_SE = c()
+
+#lam2_hat = c()
+#lam2_SE = c()
+
+#kappa1=c()
+#kappa2=c()
+
+CEN=c()
+
+
+ptm <- proc.time()
+for(ii in 1:m)
+{
+  t.event=t.death=event=death=Z1=group=NULL
+  ij=0
+  for(i in 1:G){
+    u_i=rgamma(1,shape=1/eta_true,scale=eta_true)
+    for(j in 1:N){
+      ij=ij+1
+      group[ij]=i
+      Z1[ij]=runif(1)
+      r1_ij=r1_true*u_i*exp(beta1_true*Z1[ij])
+      r2_ij=r2_true*(u_i^alpha_true)*exp(beta2_true*Z1[ij])
+      V1=runif(1)
+      V2=runif(1)
+      X_ij=-1/r1_ij*log(1-V1);W=(1-V1)^(-theta_true)
+      D_ij=1/theta_true/r2_ij*log( 1-W+W*(1-V2)^(-theta_true/(theta_true+1)) )
+      C_ij=runif(1,min=0,max=5)
+      t.event[ij]=min(X_ij,D_ij,C_ij)
+      t.death[ij]=min(D_ij,C_ij)
+      event[ij]=as.numeric( t.event[ij]==X_ij )
+      death[ij]=as.numeric( t.death[ij]==D_ij )
+    }
+  }
+  CEN[ii]=sum(event==0 & death==0)/(G*N)
+  Z1=as.matrix(Z1)
+  joint=try(jointCox.reg.weibull(t.event=t.event,event=event,t.death=t.death,
+                                 death=death,Z1=Z1,Z2=Z1,group=group,alpha=alpha_true,
+                                 kappa_grid=seq(10,1000,length=10),LCV_plot=F))
+  if(class(joint) == "try-error")
+  {
+    next
+  }
+  beta1_hat[ii]=joint$beta1[1]
+  beta1_SE[ii]=joint$beta1[2]
+  beta1_CP[ii]=ifelse(beta1_true>=joint$beta1[3] & beta1_true<=joint$beta1[4],1,0)
+  
+  beta2_hat[ii]=joint$beta2[1]
+  beta2_SE[ii]=joint$beta2[2]
+  beta2_CP[ii]=ifelse(beta2_true>=joint$beta2[3] & beta2_true<=joint$beta2[4],1,0)
+  
+  eta_hat[ii]=joint$eta[1]
+  eta_SE[ii]=joint$eta[2]
+  eta_CP[ii]=ifelse(eta_true>=joint$eta[3] & eta_true<=joint$eta[4],1,0)
+  
+  theta_hat[ii]=joint$theta[1]
+  theta_SE[ii]=joint$theta[2]
+  theta_CP[ii]=ifelse(theta_true>=joint$theta[3] & theta_true<=joint$theta[4],1,0)
+  
+  #lam1_hat[ii] = joint$g
+  #lam1_SE[ii] = sqrt(joint$g_var)
+  
+  #lam2_hat[ii] = joint$h
+  #lam2_SE[ii] = sqrt(joint$h_var)
+  
+  #kappa1[ii]=joint$LCV1[1]
+  #kappa2[ii]=joint$LCV2[1]
+  
+  alpha_0 = joint$g[1]
+  lambda_0 = joint$g[2]
+  if(ii==1)
+  {
+    #windows()
+    plot(t,rep(1,length(t)),ylim = c(0,2),xlab = "time",ylab = "Baseline hazard for TTP",type = "l",lwd=2)
+    curve(weibull.h, 0, 5, add = T)
+  }
+  if(ii>1 & ii<=50)
+  {
+    curve(weibull.h, 0, 5, add = T)
+  }
+}
+proc.time() - ptm
+#legend(3.4,2,c("Estimated","True"),lwd = c(1,2),cex = 0.8)
+#savePlot(filename = "test",type = "png")
+
+Beta1=data.frame(Parameter="beta1",True=beta1_true,Mean=mean(beta1_hat),SD=sd(beta1_hat),SE=mean(beta1_SE),CP=mean(beta1_CP))
+Beta2=data.frame(Parameter="beta2",True=beta2_true,Mean=mean(beta2_hat),SD=sd(beta2_hat),SE=mean(beta2_SE),CP=mean(beta2_CP))
+Eta=data.frame(Parameter="eta",True=eta_true,Mean=mean(eta_hat),SD=sd(eta_hat),SE=mean(eta_SE),CP=mean(eta_CP))
+Theta=data.frame(Parameter="theta",True=theta_true,Mean=mean(theta_hat),SD=sd(theta_hat),SE=mean(theta_SE),CP=mean(theta_CP))
+
+
+joint_data=rbind(Beta1,Beta2,Eta,Theta)
+joint_data
+mean(CEN)
+write.table(joint_data,file = "joint1.weibull.csv",sep = ",")
+
+# weibull simulation =========================================================
+
+
+
+
+
+
+
+
+# exponential simulation ===================================================================
+m=10
+beta1_hat=c()
+beta1_SE=c()
+beta1_CP=c()
+
+beta2_hat=c()
+beta2_SE=c()
+beta2_CP=c()
+
+eta_hat=c()
+eta_SE=c()
+eta_CP=c()
+
+theta_hat=c()
+theta_SE=c()
+theta_CP=c()
+
+lam1_hat = c()
+lam1_SE = c()
+
+lam2_hat = c()
+lam2_SE = c()
+
+CEN=c()
+
+code = c()
+No.of.iterations = c()
+No.of.randomizations = c()
+
+ptm <- proc.time()
+for(ii in 1:m)
+{
+  t.event=t.death=event=death=Z1=group=NULL
+  ij=0
+  for(i in 1:G){
+    u_i=rgamma(1,shape=1/eta_true,scale=eta_true)
+    for(j in 1:N){
+      ij=ij+1
+      group[ij]=i
+      Z1[ij]=runif(1)
+      r1_ij=r1_true*u_i*exp(beta1_true*Z1[ij])
+      r2_ij=r2_true*(u_i^alpha_true)*exp(beta2_true*Z1[ij])
+      V1=runif(1)
+      V2=runif(1)
+      X_ij=-1/r1_ij*log(1-V1);W=(1-V1)^(-theta_true)
+      D_ij=1/theta_true/r2_ij*log( 1-W+W*(1-V2)^(-theta_true/(theta_true+1)) )
+      C_ij=runif(1,min=0,max=5)
+      t.event[ij]=min(X_ij,D_ij,C_ij)
+      t.death[ij]=min(D_ij,C_ij)
+      event[ij]=as.numeric( t.event[ij]==X_ij )
+      death[ij]=as.numeric( t.death[ij]==D_ij )
+    }
+  }
+  CEN[ii]=sum(event==0 & death==0)/(G*N)
+  Z1=as.matrix(Z1)
+  joint=try(jointCox.reg.exponential(t.event=t.event,event=event,t.death=t.death,
+                                 death=death,Z1=Z1,Z2=Z1,group=group,alpha=alpha_true,
+                                 kappa_grid=seq(10,1000,length=10),LCV_plot=F))
+  if(class(joint) == "try-error")
+  {
+    next
+  }
+  beta1_hat[ii]=joint$beta1[1]
+  beta1_SE[ii]=joint$beta1[2]
+  beta1_CP[ii]=ifelse(beta1_true>=joint$beta1[3] & beta1_true<=joint$beta1[4],1,0)
+  
+  beta2_hat[ii]=joint$beta2[1]
+  beta2_SE[ii]=joint$beta2[2]
+  beta2_CP[ii]=ifelse(beta2_true>=joint$beta2[3] & beta2_true<=joint$beta2[4],1,0)
+  
+  eta_hat[ii]=joint$eta[1]
+  eta_SE[ii]=joint$eta[2]
+  eta_CP[ii]=ifelse(eta_true>=joint$eta[3] & eta_true<=joint$eta[4],1,0)
+  
+  theta_hat[ii]=joint$theta[1]
+  theta_SE[ii]=joint$theta[2]
+  theta_CP[ii]=ifelse(theta_true>=joint$theta[3] & theta_true<=joint$theta[4],1,0)
+  
+  code[ii] = joint$code
+  No.of.iterations[ii] = joint$No.of.iterations
+  No.of.randomizations[ii] = joint$No.of.randomizations
+  
+  lam1_hat[ii] = joint$g
+  lam1_SE[ii] = sqrt(joint$g_var)
+  
+  lam2_hat[ii] = joint$h
+  lam2_SE[ii] = sqrt(joint$h_var)
+  
+  #kappa1[ii]=joint$LCV1[1]
+  #kappa2[ii]=joint$LCV2[1]
+  
+  lambda_0 = rep(joint$g, length(t))
+  if(ii==1)
+  {
+    #windows()
+    plot(t,rep(1,length(t)),ylim = c(0,2),xlab = "time",ylab = "Baseline hazard for TTP",type = "l",lwd=2)
+    lines(t, lambda_0)
+  }
+  if(ii>1 & ii<=50)
+  {
+    lines(t, lambda_0)
+  }
+}
+proc.time() - ptm
+#legend(3.4,2,c("Estimated","True"),lwd = c(1,2),cex = 0.8)
+#savePlot(filename = "test",type = "png")
+
+Beta1=data.frame(Parameter="beta1",True=beta1_true,Mean=mean(beta1_hat),SD=sd(beta1_hat),SE=mean(beta1_SE),CP=mean(beta1_CP))
+Beta2=data.frame(Parameter="beta2",True=beta2_true,Mean=mean(beta2_hat),SD=sd(beta2_hat),SE=mean(beta2_SE),CP=mean(beta2_CP))
+Eta=data.frame(Parameter="eta",True=eta_true,Mean=mean(eta_hat),SD=sd(eta_hat),SE=mean(eta_SE),CP=mean(eta_CP))
+Theta=data.frame(Parameter="theta",True=theta_true,Mean=mean(theta_hat),SD=sd(theta_hat),SE=mean(theta_SE),CP=mean(theta_CP))
+
+joint_data=rbind(Beta1,Beta2,Eta,Theta)
+joint_data
+mean(CEN)
+write.table(joint_data,file = "joint.exponential.csv",sep = ",")
+
+code
+No.of.randomizations
+which(No.of.randomizations>1)
+which(beta2_SE)
+
+
+# exponential simulation ===================================================================
+
